@@ -79,7 +79,6 @@ def read_web_page_tool(url: str) -> str:
         if driver:
             driver.quit()
 
-# --- NEW TOOL ---
 def find_links_tool(url: str) -> str:
     """Visits a URL and returns a JSON string of all links {'text': '...', 'href': '...'} found on the page."""
     print(f"[Tool Call]: find_links_tool(url='{url}')")
@@ -111,11 +110,27 @@ def find_links_tool(url: str) -> str:
             driver.quit()
 
 def download_file_tool(url: str, filename: str) -> str:
-    """Downloads a file from a URL and saves it locally."""
+    """Downloads a file from a URL and saves it locally. Handles raw URLs or JSON link lists."""
     print(f"[Tool Call]: download_file_tool(url='{url}', filename='{filename}')")
+    
+    # Clean up URL if it came from find_links_tool
+    clean_url = url.strip()
+    if clean_url.startswith("[") or clean_url.startswith("{"):
+        print("[Tool Logic]: Input looks like a JSON string. Attempting to extract URL...")
+        try:
+            data = json.loads(clean_url)
+            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict) and "href" in data[0]:
+                clean_url = data[0]["href"]
+                print(f"[Tool Logic]: Extracted URL: {clean_url}")
+            elif isinstance(data, dict) and "href" in data:
+                clean_url = data["href"]
+                print(f"[Tool Logic]: Extracted URL: {clean_url}")
+        except Exception as e:
+             print(f"[Tool Logic]: JSON parsing failed ({e}). Treating as raw string.")
+
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'}
-        response = requests.get(url, headers=headers)
+        response = requests.get(clean_url, headers=headers)
         response.raise_for_status() 
         with open(filename, 'wb') as f:
             f.write(response.content)
@@ -215,7 +230,7 @@ TOOLS_DEFINITION = """
 # Dictionary to map tool names to the actual Python functions
 TOOLS_MAP = {
     "read_web_page_tool": read_web_page_tool,
-    "find_links_tool": find_links_tool, # --- ADDED ---
+    "find_links_tool": find_links_tool, 
     "download_file_tool": download_file_tool,
     "read_pdf_tool": read_pdf_tool,
     "run_python_tool": run_python_tool,
@@ -227,6 +242,7 @@ def call_llm_brain(scraped_text: str, current_task_url: str, email: str, secret:
     if not llm_client:
         return [{"error": "LLM client not initialized"}]
 
+    # --- UPDATED SYSTEM PROMPT (Added Rule 12) ---
     system_prompt = f"""
     You are an autonomous data analysis agent. Your goal is to solve a quiz.
     You will be given the text from a quiz webpage.
@@ -247,11 +263,12 @@ def call_llm_brain(scraped_text: str, current_task_url: str, email: str, secret:
     4. For `run_python_tool`, the code *must* print the result *to stdout*. Do not just assign to a variable.
     5. To use the output of a previous step, pass the string \"<last_result>\" as the `text_input` argument in `run_python_tool`. Your Python code will then receive that text in a variable named `text_input`.
     6. Be smart. If the quiz asks you to parse text, the plan is: [read_web_page_tool, run_python_tool (with `re`, `text_input`, and a `print` statement), submit_answer].
-    7. **NEW RULE:** If the quiz text mentions a file (e.g., "CSV file", "Download this") but you cannot see the full URL, you MUST use `find_links_tool` on the *current task URL* to get a list of all links, then use that to find the correct download URL for `download_file_tool`.
+    7. If the quiz text mentions a file (e.g., "CSV file", "Download this") but you cannot see the full URL, you MUST use `find_links_tool` on the *current task URL* to get a list of all links, then use that to find the correct download URL for `download_file_tool`.
     8. When using `re` (regex), be robust. The text is human-readable and may have slight variations. Use flags like `re.IGNORECASE` and flexible patterns (like `r'is:? (\d+)'`) to avoid errors.
     9. If you are given a "previous_error" message, it means your last plan failed. Analyze the error and the original text, then provide a *new*, corrected plan. Do not repeat the same mistake.
-    10. **Expert Tip:** If you see a `pandas` error like "Error tokenizing data" or "C error", the CSV is malformed. Do NOT use `error_bad_lines`. Instead, try to fix it by passing parameters to `pd.read_csv()`, such as `header=None`, `delimiter=','`, or `on_bad_lines='skip'`.
-    11. Respond *only* with the JSON. No other text.
+    10. **Expert Tip 1:** If you see a `pandas` error like "Error tokenizing data" or "C error", the CSV is malformed. Do NOT use `error_bad_lines`. Instead, try to fix it by passing parameters to `pd.read_csv()`, such as `header=None`, `delimiter=','`, or `on_bad_lines='skip'`.
+    11. **Expert Tip 2:** When analyzing a CSV or Dataframe, NEVER assume column names (like 'value' or 'cutoff'). Your Python code should ALWAYS print `df.head()` or `df.columns` first to inspect the data structure, and then proceed to filtering in the same script.
+    12. Respond *only* with the JSON. No other text.
     """
 
     user_prompt = f"""
@@ -343,7 +360,7 @@ def call_llm_brain(scraped_text: str, current_task_url: str, email: str, secret:
         print(f"[Brain Error]: LLM call failed: {e}")
         return []
 
-# --- 4. The "Solver" Agent (Main Loop - UPDATED) ---
+# --- 4. The "Solver" Agent (Main Loop) ---
 def solve_quiz_in_background(task_url: str, email: str, secret: str):
     print(f"\n--- AGENT TASK STARTED ---")
     current_task_url = task_url
@@ -357,31 +374,27 @@ def solve_quiz_in_background(task_url: str, email: str, secret: str):
         
         last_error = None
         retry_count = 0
-        MAX_RETRIES = 2 # 1 initial attempt + 2 retries = 3 total attempts per URL
+        MAX_RETRIES = 2 
         
-        # --- UPDATED: Main retry loop ---
         while retry_count <= MAX_RETRIES:
             if last_error:
                 print(f"\n[Agent]: Retrying... (Attempt {retry_count + 1}/{MAX_RETRIES + 1} for this URL)")
             
-            # 1. Scrape (read_web_page_tool is fine, the LLM will decide if it needs links)
             scraped_text = read_web_page_tool(current_task_url)
             if scraped_text.startswith("Error:"):
                 print("Failed to scrape initial page. Aborting task.")
                 current_task_url = None
                 break
             
-            # 2. Get Plan
             plan = call_llm_brain(scraped_text, current_task_url, email, secret, previous_error=last_error)
             last_error = None
             
-            if not plan: # This means the LLM failed to return a valid JSON plan
+            if not plan:
                 print("Failed to get a valid plan from LLM.")
                 last_error = "LLM failed to return a valid plan."
                 retry_count += 1
-                continue # Go to the next retry
+                continue 
             
-            # 3. Execute Plan
             last_tool_output = None
             plan_failed = False
 
@@ -460,18 +473,15 @@ def solve_quiz_in_background(task_url: str, email: str, secret: str):
                     plan_failed = True
                     break
             
-            # --- After plan execution ---
             if not plan_failed:
-                break # Plan succeeded, exit retry loop
+                break 
             else:
-                # Plan failed, increment and retry
                 retry_count += 1
                 print(f"[Agent]: Plan failed. Error: {last_error}")
         
-        # --- After retry loop ---
         if retry_count > MAX_RETRIES:
             print(f"[Agent]: FAILED to solve quiz {current_task_url} after {MAX_RETRIES + 1} attempts. Aborting chain.")
-            current_task_url = None # Give up on this quiz chain
+            current_task_url = None
     
     if quiz_count >= MAX_QUIZZES:
         print(f"[Agent]: Reached max quiz limit ({MAX_QUIZZES}). Stopping.")
@@ -502,7 +512,7 @@ def read_root():
 
 # --- 6. Run the Server / Test Mode ---
 
-TEST_MODE = True
+TEST_MODE = False
 TEST_URL = "https://tds-llm-analysis.s-anand.net/demo"
 
 if __name__ == "__main__":
